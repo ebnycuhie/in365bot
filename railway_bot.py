@@ -369,7 +369,7 @@ def kb_main(source_count: int) -> InlineKeyboardMarkup:
          _btn("🎁 Referral", "referral")],
         [_btn("❓ How to use", "how_to_use"),
          _btn("⭐ Premium", "premium")],
-        [_url_btn("💬 Contact us", "https://t.me/madbots_talk")],
+        [_url_btn("💬 Contact us", "https://t.me/copyrightpost")],
     ])
 
 
