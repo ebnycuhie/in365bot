@@ -1,0 +1,5 @@
+python-telegram-bot==21.3
+psycopg2-binary==2.9.10
+feedparser==6.0.10
+requests==2.31.0
+python-dotenv==1.0.0
