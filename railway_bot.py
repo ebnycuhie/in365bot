@@ -330,7 +330,7 @@ def kb_main(source_count):
         [btn("🚀 Direct connection",                           "direct_conn")],
         [btn("🔀 Private/Channel/Group modes",                 "modes")],
         [btn(f"📂 My feed [{source_count}]", "my_feed"), btn("⚙️ Settings",  "settings")],
-        [btn("🎁 Contact us",                "contact"), btn("📋 History",   "history")],
+        [btn("📬 Contact us",                "contact"), btn("📋 History",   "history")],
         [btn("🔮 RSS generator",                               "rss_gen")],
         [btn("🏷️ Referral program",                            "referral")],
         [btn("📚 How to use this bot  ↗",                     "how_to_use")],
@@ -1145,7 +1145,7 @@ class Bot:
 
         elif data == "contact":
             await query.edit_message_text(
-                "🎁 <b>Contact &amp; Support</b>\n\n"
+                "📬 <b>Contact &amp; Support</b>\n\n"
                 f"📢 <a href='{CHANNEL_INVITE_URL}'>@copyrightpost</a>\n\nWe read every message!",
                 parse_mode="HTML", disable_web_page_preview=True,
                 reply_markup=InlineKeyboardMarkup([
