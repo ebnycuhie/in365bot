@@ -1,8 +1,0 @@
-[phases.setup]
-nixPkgs = ["python3"]
-
-[phases.install]
-cmds = ["python3 -m ensurepip --upgrade", "python3 -m pip install -r requirements_railway.txt"]
-
-[start]
-cmd = "python3 railway_bot.py"
