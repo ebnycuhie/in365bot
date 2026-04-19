@@ -1,8 +1,8 @@
 [phases.setup]
-nixPkgs = ["python311"]
+nixPkgs = ["python311", "python311Packages.pip"]
 
 [phases.install]
-cmds = ["pip install -r requirements_railway.txt"]
+cmds = ["pip3 install -r requirements_railway.txt"]
 
 [start]
-cmd = "python railway_bot.py"
+cmd = "python3 railway_bot.py"
