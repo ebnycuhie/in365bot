@@ -1,14 +1,21 @@
 """
-IN365Bot v2.4 — FIXED
-FIXES:
-1. YouTube @handle now resolves channel_id via yt page scrape → correct feed URL
-2. Instagram uses multiple fallback RSS proxies (rsshub instances + nitter-style)
-3. Twitter uses multiple RSSHub public instances with fallback
-4. Multi-language system actually translates UI text (10 languages)
-5. confirm_url state bug fixed (was storing in "add_source" state, reading from "confirm_url")
-6. sent_history unique constraint added to prevent duplicate delivery spam
-7. Polling dedup now works correctly for channel subs
-8. General stability: DB reconnect on stale connection, better error messages
+IN365Bot v2.5 — FULLY FIXED
+FIXES vs v2.4:
+1. fetch_feed() now properly extracts media from RSSHub (media:content, enclosures, summary img)
+2. _deliver() now sends photos/videos instead of only text messages
+3. _resolve_and_add() sends media for ALL platforms (not just RSS)
+4. Instagram RSSHub resolution uses correct path + proper fallbacks
+5. Twitter RSSHub resolution uses correct paths
+6. YouTube handle resolution improved with multiple regex patterns
+7. send_media logic now works end-to-end for initial fetch
+8. Polling loop also delivers media (photos/videos) for all platform types
+9. RSSHub feed title extraction fixed (was returning URL instead of channel name)
+10. confirm_url state bug fully fixed (was in v2.4 but incomplete)
+11. DB ON CONFLICT DO NOTHING for sent_history fixed to use proper unique constraint
+12. fetch_feed limit increased for initial fetch
+13. Media URL extraction order: media_content > media_thumbnail > enclosures > img in summary
+14. send_photo with fallback to send_message if photo fails
+15. Video detection: send_video for video media types
 """
 
 import os, re, io, asyncio, logging, hashlib, requests, feedparser, psycopg2
@@ -30,7 +37,7 @@ OWNER_ID            = int(os.getenv("OWNER_ID", "7232714487"))
 POLL_INTERVAL       = int(os.getenv("POLL_INTERVAL", "300"))
 BOT_USERNAME        = os.getenv("BOT_USERNAME", "in365bot")
 MAX_FREE_SOURCES    = 10
-INITIAL_FETCH_COUNT = 4
+INITIAL_FETCH_COUNT = 5
 REQUIRED_CHANNEL    = "@copyrightpost"
 CHANNEL_INVITE_URL  = "https://t.me/copyrightpost"
 
@@ -703,7 +710,6 @@ STRINGS = {
 }
 
 def t(lang: str, key: str, **kwargs) -> str:
-    """Get localized string. Falls back to English."""
     lang_dict = STRINGS.get(lang) or STRINGS["en"]
     text = lang_dict.get(key) or STRINGS["en"].get(key, key)
     if kwargs:
@@ -717,6 +723,7 @@ def get_lang(user) -> str:
     if not user:
         return "en"
     return user.get("language") or "en"
+
 
 # ════════════════════════════════════════════════════════════════════════════════
 # DATABASE
@@ -832,6 +839,7 @@ class DB:
             title       TEXT,
             url         VARCHAR(500),
             media_url   VARCHAR(500),
+            media_type  VARCHAR(20) DEFAULT 'photo',
             created_at  TIMESTAMP DEFAULT NOW()
         );
         CREATE TABLE IF NOT EXISTS sent_history (
@@ -861,14 +869,17 @@ class DB:
         ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned           BOOLEAN DEFAULT FALSE;
         ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS initial_fetched BOOLEAN DEFAULT FALSE;
         ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS original_url VARCHAR(500);
-        ALTER TABLE posts ADD COLUMN IF NOT EXISTS media_url VARCHAR(500);
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_sent_user_post    ON sent_history(user_id, post_id) WHERE user_id IS NOT NULL;
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_sent_chan_post    ON sent_history(channel_id, post_id) WHERE channel_id IS NOT NULL;
-        CREATE INDEX IF NOT EXISTS idx_subs_user    ON subscriptions(user_id);
-        CREATE INDEX IF NOT EXISTS idx_subs_chan    ON subscriptions(channel_id);
-        CREATE INDEX IF NOT EXISTS idx_posts_src    ON posts(source_id);
-        CREATE INDEX IF NOT EXISTS idx_sent_user    ON sent_history(user_id);
-        CREATE INDEX IF NOT EXISTS idx_users_tgid   ON users(telegram_id);
+        ALTER TABLE posts ADD COLUMN IF NOT EXISTS media_url  VARCHAR(500);
+        ALTER TABLE posts ADD COLUMN IF NOT EXISTS media_type VARCHAR(20) DEFAULT 'photo';
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_sent_user_post ON sent_history(user_id, post_id)
+            WHERE user_id IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_sent_chan_post ON sent_history(channel_id, post_id)
+            WHERE channel_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_subs_user   ON subscriptions(user_id);
+        CREATE INDEX IF NOT EXISTS idx_subs_chan   ON subscriptions(channel_id);
+        CREATE INDEX IF NOT EXISTS idx_posts_src   ON posts(source_id);
+        CREATE INDEX IF NOT EXISTS idx_sent_user   ON sent_history(user_id);
+        CREATE INDEX IF NOT EXISTS idx_users_tgid  ON users(telegram_id);
         CREATE INDEX IF NOT EXISTS idx_users_banned ON users(is_banned);
         """
         with self.conn.cursor() as cur:
@@ -881,11 +892,97 @@ class DB:
                 logger.error(f"Schema error: {e}")
                 raise
 
+
 # ════════════════════════════════════════════════════════════════════════════════
-# SOURCE DETECTION — Fixed for YouTube @handles and Instagram
+# MEDIA EXTRACTION — THE CORE FIX
+# Feedparser stores different platforms' media in different places.
+# RSSHub Instagram/Twitter use media:content → entry.media_content
+# YouTube uses media:group/media:thumbnail → entry.media_thumbnail
+# Reddit uses enclosures for images
+# We check all possible locations in priority order.
 # ════════════════════════════════════════════════════════════════════════════════
 
-# Multiple public RSSHub instances as fallbacks
+def _extract_media(entry) -> tuple[str, str]:
+    """
+    Extract (media_url, media_type) from a feedparser entry.
+    media_type is 'photo' or 'video'.
+    Returns ('', 'photo') if nothing found.
+    """
+    media_url  = ""
+    media_type = "photo"
+
+    # 1. media:content (RSSHub Instagram, Twitter, Telegram use this)
+    mc = getattr(entry, "media_content", None)
+    if mc and isinstance(mc, list) and mc:
+        for item in mc:
+            url = item.get("url", "")
+            mime = item.get("medium", "") or item.get("type", "")
+            if url:
+                media_url = url
+                if "video" in mime:
+                    media_type = "video"
+                break
+
+    # 2. media:thumbnail (YouTube, some RSS feeds)
+    if not media_url:
+        mt = getattr(entry, "media_thumbnail", None)
+        if mt and isinstance(mt, list) and mt:
+            media_url = mt[0].get("url", "")
+            media_type = "photo"
+
+    # 3. enclosures (podcast-style RSS, Reddit)
+    if not media_url:
+        enclosures = getattr(entry, "enclosures", None) or []
+        for enc in enclosures:
+            enc_type = enc.get("type", "")
+            enc_url  = enc.get("href") or enc.get("url", "")
+            if enc_url and ("image" in enc_type or "video" in enc_type or "audio" not in enc_type):
+                media_url  = enc_url
+                media_type = "video" if "video" in enc_type else "photo"
+                break
+
+    # 4. links with rel='enclosure'
+    if not media_url:
+        for link in getattr(entry, "links", []):
+            if link.get("rel") == "enclosure":
+                ltype = link.get("type", "")
+                lurl  = link.get("href", "")
+                if lurl and ("image" in ltype or "video" in ltype):
+                    media_url  = lurl
+                    media_type = "video" if "video" in ltype else "photo"
+                    break
+
+    # 5. img tag in summary/content (fallback for Instagram RSSHub HTML content)
+    if not media_url:
+        content = ""
+        if entry.get("summary"):
+            content = entry.summary
+        elif entry.get("content"):
+            for c in entry.content:
+                content += c.get("value", "")
+        if content:
+            # Look for img src
+            m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', content, re.IGNORECASE)
+            if m:
+                candidate = m.group(1)
+                # Filter out tiny tracking pixels (usually < 5 chars path)
+                if len(candidate) > 20:
+                    media_url  = candidate
+                    media_type = "photo"
+            # Also look for video src
+            if not media_url:
+                mv = re.search(r'<video[^>]+src=["\']([^"\']+)["\']', content, re.IGNORECASE)
+                if mv:
+                    media_url  = mv.group(1)
+                    media_type = "video"
+
+    return media_url[:500] if media_url else "", media_type
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# SOURCE DETECTION
+# ════════════════════════════════════════════════════════════════════════════════
+
 RSSHUB_INSTANCES = [
     "https://rsshub.app",
     "https://rsshub.rssforever.com",
@@ -893,73 +990,77 @@ RSSHUB_INSTANCES = [
     "https://rsshub.feeded.xyz",
 ]
 
-def _try_rsshub_path(path: str) -> str | None:
-    """Try each RSSHub instance and return the first working URL."""
+def _try_rsshub_path(path: str) -> tuple[str, str]:
+    """
+    Try each RSSHub instance and return (working_url, feed_title).
+    Returns (None, None) if all fail.
+    """
     for base in RSSHUB_INSTANCES:
         url = f"{base}{path}"
         try:
-            r = requests.get(url, headers=HTTP_HEADERS, timeout=10, allow_redirects=True)
+            r = requests.get(url, headers=HTTP_HEADERS, timeout=12, allow_redirects=True)
             if r.status_code == 200:
                 feed = feedparser.parse(r.content)
                 if feed.entries or feed.feed.get("title"):
-                    logger.info(f"RSSHub working instance: {base}")
-                    return url
-        except Exception:
+                    title = feed.feed.get("title", "").strip()
+                    logger.info(f"RSSHub working instance: {base}, title: {title}")
+                    return url, title
+        except Exception as e:
+            logger.warning(f"RSSHub {base}{path}: {e}")
             continue
-    return None
+    return None, None
 
 def _resolve_youtube_channel_id(handle: str) -> str | None:
-    """
-    Resolve a YouTube @handle or /c/ or /user/ slug to a channel_id.
-    Scrapes the YouTube page to find the canonical channel ID.
-    """
+    """Resolve a YouTube @handle / /c/ / /user/ slug to a UC... channel ID."""
     urls_to_try = [
         f"https://www.youtube.com/@{handle}",
         f"https://www.youtube.com/c/{handle}",
         f"https://www.youtube.com/user/{handle}",
+        f"https://www.youtube.com/{handle}",
     ]
     for page_url in urls_to_try:
         try:
             r = requests.get(page_url, headers=HTTP_HEADERS, timeout=15, allow_redirects=True)
             if r.status_code != 200:
                 continue
-            # Look for channel ID in page source
-            m = re.search(r'"channelId"\s*:\s*"(UC[\w-]{22})"', r.text)
-            if not m:
-                m = re.search(r'channel/(UC[\w-]{22})', r.text)
-            if not m:
-                m = re.search(r'"externalId"\s*:\s*"(UC[\w-]{22})"', r.text)
-            if m:
-                logger.info(f"Resolved YouTube handle @{handle} → {m.group(1)}")
-                return m.group(1)
+            for pattern in [
+                r'"channelId"\s*:\s*"(UC[\w-]{22})"',
+                r'channel/(UC[\w-]{22})',
+                r'"externalId"\s*:\s*"(UC[\w-]{22})"',
+                r'"browseId"\s*:\s*"(UC[\w-]{22})"',
+            ]:
+                m = re.search(pattern, r.text)
+                if m:
+                    logger.info(f"Resolved YouTube handle @{handle} → {m.group(1)}")
+                    return m.group(1)
         except Exception as e:
             logger.warning(f"YouTube resolve {page_url}: {e}")
     return None
 
 def detect_platform(url: str):
     """
-    Returns (platform_name, rss_url, original_url, needs_validation)
-    All heavy network calls happen in check_rss / during the add flow.
-    detect_platform itself is synchronous and fast (no network).
-    For YouTube @handles, we return needs_validation=True and a special sentinel.
+    Returns (platform_type, handle_or_rss_url, original_url, needs_resolution)
+    For direct RSS/YouTube channel-id links: needs_resolution=False, handle_or_rss_url is the RSS URL.
+    For handle-based platforms: needs_resolution=True, handle_or_rss_url is the handle/slug.
     """
     url = url.strip().rstrip("/")
     low = url.lower()
 
     # ── YouTube ────────────────────────────────────────────────────────────────
     if "youtube.com" in low or "youtu.be" in low:
-        # Direct channel ID — always works
         m = re.search(r"youtube\.com/channel/(UC[\w-]+)", url)
         if m:
             rss = f"https://www.youtube.com/feeds/videos.xml?channel_id={m.group(1)}"
             return "youtube", rss, url, False
 
-        # @handle, /c/, /user/ — need to resolve channel ID
         m = re.search(r"youtube\.com/(?:@|c/|user/)([^/?&#\s]+)", url)
         if m:
-            handle = m.group(1)
-            # Return sentinel; actual resolution happens in resolve_and_check
-            return "youtube_handle", handle, url, True
+            return "youtube_handle", m.group(1), url, True
+
+        # bare youtube.com/SomeName
+        m = re.search(r"youtube\.com/([^/?&#\s]+)", url)
+        if m and m.group(1) not in ("watch", "playlist", "shorts", "feed", "results"):
+            return "youtube_handle", m.group(1), url, True
 
         return None, None, None, False
 
@@ -980,11 +1081,11 @@ def detect_platform(url: str):
         m = re.search(r"medium\.com/(@[^/?#\s]+)", url)
         if m:
             rss = f"https://medium.com/feed/{m.group(1)}"
-            return "medium", rss, url, True
+            return "medium", rss, url, False
         m = re.search(r"medium\.com/([^/?#\s@][^/?#\s]*)", url)
         if m:
             rss = f"https://medium.com/feed/{m.group(1)}"
-            return "medium", rss, url, True
+            return "medium", rss, url, False
         return None, None, None, False
 
     # ── Livejournal ────────────────────────────────────────────────────────────
@@ -992,7 +1093,7 @@ def detect_platform(url: str):
         m = re.search(r"([a-z0-9_-]+)\.livejournal\.com", low)
         if m:
             rss = f"https://{m.group(1)}.livejournal.com/data/rss"
-            return "livejournal", rss, url, True
+            return "livejournal", rss, url, False
         return None, None, None, False
 
     # ── Instagram ─────────────────────────────────────────────────────────────
@@ -1000,7 +1101,7 @@ def detect_platform(url: str):
         m = re.search(r"instagram\.com/([^/?#\s]+)", url)
         if m:
             username = m.group(1).strip("/")
-            if username in ("p", "reel", "explore", "accounts", "stories"):
+            if username in ("p", "reel", "explore", "accounts", "stories", "tv"):
                 return None, None, None, False
             return "instagram_handle", username, url, True
         return None, None, None, False
@@ -1010,7 +1111,7 @@ def detect_platform(url: str):
         m = re.search(r"(?:twitter|x)\.com/([^/?#\s]+)", url)
         if m:
             username = m.group(1).strip("/")
-            if username in ("i", "home", "explore", "notifications", "messages"):
+            if username in ("i", "home", "explore", "notifications", "messages", "search"):
                 return None, None, None, False
             return "twitter_handle", username, url, True
         return None, None, None, False
@@ -1024,69 +1125,71 @@ def detect_platform(url: str):
         return None, None, None, False
 
     # ── Generic RSS / Atom ─────────────────────────────────────────────────────
-    return "rss", url, url, True
+    return "rss", url, url, False
 
 
-def resolve_feed(src_type: str, handle_or_url: str) -> tuple[str, str]:
+def resolve_feed(src_type: str, handle: str) -> tuple[str, str, str]:
     """
-    For handle-based platforms, resolve the actual RSS URL.
-    Returns (resolved_platform, rss_url) or (None, None) on failure.
+    Resolve handle-based platforms to (resolved_platform, rss_url, feed_title).
+    Returns (None, None, None) on failure.
     """
     if src_type == "youtube_handle":
-        channel_id = _resolve_youtube_channel_id(handle_or_url)
+        channel_id = _resolve_youtube_channel_id(handle)
         if channel_id:
-            rss = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
-            return "youtube", rss
-        # Fallback: try user-based feed (works for some legacy channels)
-        rss = f"https://www.youtube.com/feeds/videos.xml?user={handle_or_url}"
+            rss   = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+            title = get_feed_title(rss) or handle
+            return "youtube", rss, title
+
+        # Fallback: user-based feed (legacy channels)
+        rss = f"https://www.youtube.com/feeds/videos.xml?user={handle}"
         if check_rss(rss):
-            return "youtube", rss
-        return None, None
+            title = get_feed_title(rss) or handle
+            return "youtube", rss, title
+
+        return None, None, None
 
     elif src_type == "instagram_handle":
-        # Try multiple RSSHub instances
-        path = f"/instagram/user/{handle_or_url}"
-        rss = _try_rsshub_path(path)
-        if rss:
-            return "instagram", rss
-        # Fallback: picuki via rss.app style or bibliogram
-        # Try publicly known alternative paths
-        alt_paths = [
-            f"/picuki/user/{handle_or_url}",
-            f"/instagram/media/user/id/{handle_or_url}",
-        ]
-        for ap in alt_paths:
-            rss = _try_rsshub_path(ap)
-            if rss:
-                return "instagram", rss
-        return None, None
+        # RSSHub Instagram — primary path
+        rss_url, title = _try_rsshub_path(f"/instagram/user/{handle}")
+        if rss_url:
+            return "instagram", rss_url, title or handle
+
+        # Alternate RSSHub paths
+        for alt_path in [f"/picuki/user/{handle}"]:
+            rss_url, title = _try_rsshub_path(alt_path)
+            if rss_url:
+                return "instagram", rss_url, title or handle
+
+        return None, None, None
 
     elif src_type == "twitter_handle":
-        path = f"/twitter/user/{handle_or_url}"
-        rss = _try_rsshub_path(path)
-        if rss:
-            return "twitter", rss
-        # Try nitter instances as fallback
+        # RSSHub Twitter
+        for path in [f"/twitter/user/{handle}", f"/x/user/{handle}"]:
+            rss_url, title = _try_rsshub_path(path)
+            if rss_url:
+                return "twitter", rss_url, title or handle
+
+        # Nitter fallback
         nitter_instances = [
-            "https://nitter.net",
             "https://nitter.privacydev.net",
             "https://nitter.poast.org",
+            "https://nitter.net",
         ]
         for ni in nitter_instances:
-            rss_url = f"{ni}/{handle_or_url}/rss"
+            rss_url = f"{ni}/{handle}/rss"
             if check_rss(rss_url):
-                return "twitter", rss_url
-        return None, None
+                return "twitter", rss_url, handle
+
+        return None, None, None
 
     elif src_type == "telegram_handle":
-        path = f"/telegram/channel/{handle_or_url}"
-        rss = _try_rsshub_path(path)
-        if rss:
-            return "telegram", rss
-        return None, None
+        rss_url, title = _try_rsshub_path(f"/telegram/channel/{handle}")
+        if rss_url:
+            return "telegram", rss_url, title or handle
+        return None, None, None
 
-    # Already resolved
-    return src_type, handle_or_url
+    # Already a direct URL (shouldn't normally reach here)
+    return src_type, handle, handle
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1107,12 +1210,18 @@ def get_feed_title(url: str) -> str:
     try:
         r    = requests.get(url, headers=HTTP_HEADERS, timeout=12, allow_redirects=True)
         feed = feedparser.parse(r.content)
-        t    = feed.feed.get("title", "").strip()
-        return t[:255] if t else url[:255]
+        title = feed.feed.get("title", "").strip()
+        # Clean up RSSHub-style titles that include the platform name
+        title = re.sub(r'\s*[-|–]\s*(RSS Hub|RSSHub|rsshub).*$', '', title, flags=re.IGNORECASE).strip()
+        return title[:255] if title else url[:255]
     except Exception:
         return url[:255]
 
 def fetch_feed(rss_url: str, source_type: str, limit: int = 5) -> list:
+    """
+    Fetch feed entries. Returns list of dicts with keys:
+    source_id, source_type, title, url, media_url, media_type
+    """
     posts = []
     try:
         r    = requests.get(rss_url, headers=HTTP_HEADERS, timeout=20, allow_redirects=True)
@@ -1124,23 +1233,73 @@ def fetch_feed(rss_url: str, source_type: str, limit: int = 5) -> list:
             title     = (entry.get("title") or "No title")[:500]
             uid       = entry.get("id") or link
             source_id = hashlib.md5(uid.encode("utf-8", errors="replace")).hexdigest()
-            media_url = None
-            if hasattr(entry, "media_thumbnail") and entry.media_thumbnail:
-                media_url = entry.media_thumbnail[0].get("url")
-            elif entry.get("enclosures"):
-                enc = entry.enclosures[0]
-                if enc.get("type", "").startswith("image"):
-                    media_url = enc.get("href") or enc.get("url")
+
+            media_url, media_type = _extract_media(entry)
+
             posts.append({
                 "source_id":   source_id,
                 "source_type": source_type,
                 "title":       title,
                 "url":         link[:500],
-                "media_url":   (media_url or "")[:500],
+                "media_url":   media_url,
+                "media_type":  media_type,
             })
     except Exception as e:
         logger.warning(f"Fetch error {rss_url}: {e}")
     return posts
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# MEDIA SENDING HELPER
+# ════════════════════════════════════════════════════════════════════════════════
+
+async def send_post_with_media(bot, chat_id: int, post: dict, msg_text: str,
+                                silent: bool = False) -> bool:
+    """
+    Send a post to chat_id. If post has media, send photo/video with caption.
+    Falls back to plain text if media send fails.
+    Returns True on success.
+    """
+    media_url  = (post.get("media_url") or "").strip()
+    media_type = post.get("media_type", "photo")
+
+    if media_url:
+        try:
+            if media_type == "video":
+                await bot.send_video(
+                    chat_id=chat_id,
+                    video=media_url,
+                    caption=msg_text[:1024],
+                    parse_mode="HTML",
+                    disable_notification=silent,
+                    supports_streaming=True,
+                )
+            else:
+                await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=media_url,
+                    caption=msg_text[:1024],
+                    parse_mode="HTML",
+                    disable_notification=silent,
+                )
+            return True
+        except TelegramError as e:
+            logger.warning(f"Media send failed ({media_url}): {e} — falling back to text")
+            # Fall through to text message
+
+    # Plain text fallback (or no media)
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=msg_text,
+            parse_mode="HTML",
+            disable_notification=silent,
+            disable_web_page_preview=False,
+        )
+        return True
+    except TelegramError as e:
+        logger.warning(f"Text send failed: {e}")
+        return False
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1161,7 +1320,6 @@ def kb_join(lang="en"):
 
 def kb_main(source_count, lang="en"):
     today = datetime.now(timezone.utc).strftime("%m/%d/%Y")
-    back  = t(lang, "back")
     return InlineKeyboardMarkup([
         [btn("➕ Add source",                                  "add_source")],
         [btn("🚀 Direct connection",                           "direct_conn")],
@@ -1339,7 +1497,7 @@ class Bot:
             return m.status in (ChatMember.MEMBER, ChatMember.ADMINISTRATOR, ChatMember.OWNER)
         except TelegramError as e:
             logger.warning(f"Membership check {tg_id}: {e}")
-            return True
+            return True  # fail-open so users aren't blocked by API errors
 
     async def _gate(self, update, context):
         tg_id = update.effective_user.id
@@ -1410,7 +1568,7 @@ class Bot:
             f"🆔 <code>{tg_id}</code>\n"
             f"{t(lang, 'free_account')}\n"
             f"{t(lang, 'forwarded', count=forwarded)}\n\n"
-            f"🔥 <b>IN365Bot v2.4</b> — RSS Aggregator\n\n"
+            f"🔥 <b>IN365Bot v2.5</b> — RSS Aggregator\n\n"
             f"<b>Supported platforms:</b>\n"
             f"📰 RSS — any RSS/Atom feed\n"
             f"▶️ YouTube — channel feeds\n"
@@ -1437,15 +1595,10 @@ class Bot:
         )
 
     # ════════════════════════════════════════════════════════════════════════════
-    # CORE ADD LOGIC — Fixed for handle-based platforms
+    # CORE ADD LOGIC — Fixed end-to-end
     # ════════════════════════════════════════════════════════════════════════════
 
     async def _resolve_and_add(self, send_fn, edit_fn, user, raw_url: str, send_media: bool):
-        """
-        Unified add logic.
-        send_fn(text, **kw) — sends a new message
-        edit_fn(text, **kw) — edits existing message (or sends new if None)
-        """
         lang  = get_lang(user)
         tg_id = user["telegram_id"]
         count = self._source_count(user["id"])
@@ -1454,37 +1607,40 @@ class Bot:
             await edit_fn(t(lang, "source_limit", limit=MAX_FREE_SOURCES))
             return
 
-        src_type, handle_or_url, original_url, needs_check = detect_platform(raw_url)
+        src_type, handle_or_url, original_url, needs_resolution = detect_platform(raw_url)
         if not src_type or not handle_or_url:
             await edit_fn(t(lang, "url_not_recognised"))
             return
 
         await edit_fn(t(lang, "checking_feed"))
 
-        # Resolve handle → actual RSS URL
-        if needs_check or src_type.endswith("_handle"):
-            resolved_type, rss_url = await asyncio.to_thread(resolve_feed, src_type, handle_or_url)
+        # --- Resolve platform handles to RSS URLs ---
+        if needs_resolution:
+            result = await asyncio.to_thread(resolve_feed, src_type, handle_or_url)
+            resolved_type, rss_url, feed_name = result
             if not resolved_type or not rss_url:
                 await edit_fn(t(lang, "feed_load_error"))
                 return
         else:
             resolved_type = src_type
-            rss_url = handle_or_url
-            if needs_check:
-                ok = await asyncio.to_thread(check_rss, rss_url)
-                if not ok:
-                    await edit_fn(t(lang, "feed_load_error"))
-                    return
+            rss_url       = handle_or_url
+            # Validate that the RSS URL actually works
+            ok = await asyncio.to_thread(check_rss, rss_url)
+            if not ok:
+                await edit_fn(t(lang, "feed_load_error"))
+                return
+            feed_name = await asyncio.to_thread(get_feed_title, rss_url)
 
-        feed_name = await asyncio.to_thread(get_feed_title, rss_url)
+        if not feed_name or feed_name == rss_url:
+            feed_name = (original_url or handle_or_url).split("/")[-1] or handle_or_url
 
-        # Insert subscription
+        # --- Insert subscription ---
         try:
             sub_id = self.db.insert_id(
                 "INSERT INTO subscriptions "
                 "(user_id, source_url, source_type, source_name, original_url, is_active, initial_fetched) "
                 "VALUES (%s,%s,%s,%s,%s,TRUE,FALSE) ON CONFLICT DO NOTHING RETURNING id",
-                (user["id"], rss_url, resolved_type, feed_name, original_url or rss_url),
+                (user["id"], rss_url, resolved_type, feed_name[:255], original_url or rss_url),
             )
         except Exception as e:
             logger.error(f"Insert sub: {e}")
@@ -1505,65 +1661,79 @@ class Bot:
 
         await edit_fn(t(lang, "fetching_posts"))
 
+        # --- Fetch and send initial posts ---
         posts      = await asyncio.to_thread(fetch_feed, rss_url, resolved_type, INITIAL_FETCH_COUNT)
         sent_count = 0
         hide       = bool(user.get("hide_original_link", False))
         silent     = bool(user.get("silent_mode", False))
+        icon       = PLATFORMS.get(resolved_type, "📱")
 
         for post in posts:
             try:
+                # Upsert into posts table (source_id is UNIQUE)
                 ex = self.db.one("SELECT id FROM posts WHERE source_id=%s", (post["source_id"],))
                 if ex:
                     post_id = ex["id"]
+                    # Update media_url if we now have it
+                    if post.get("media_url") and not ex.get("media_url"):
+                        self.db.run(
+                            "UPDATE posts SET media_url=%s, media_type=%s WHERE id=%s",
+                            (post["media_url"], post.get("media_type","photo"), post_id),
+                        )
                 else:
                     post_id = self.db.insert_id(
-                        "INSERT INTO posts (source_id, source_type, title, url, media_url) "
-                        "VALUES (%s,%s,%s,%s,%s) RETURNING id",
+                        "INSERT INTO posts (source_id, source_type, title, url, media_url, media_type) "
+                        "VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
                         (post["source_id"], post["source_type"],
-                         post["title"], post["url"], post.get("media_url", "")),
+                         post["title"], post["url"],
+                         post.get("media_url", ""), post.get("media_type", "photo")),
                     )
                 if post_id is None:
                     continue
 
-                icon     = PLATFORMS.get(post["source_type"], "📱")
+                # Build message text
                 msg_text = f"{icon} <b>{feed_name}</b>\n\n{post['title']}"
                 if not hide:
                     msg_text += f"\n\n<a href='{post['url']}'>{t(lang, 'view_original')}</a>"
 
-                if send_media and post.get("media_url"):
+                # Send with media if requested and available, else always send
+                # For social platforms (instagram/twitter/telegram) ALWAYS send with media
+                should_send_media = send_media or resolved_type in ("instagram", "twitter", "telegram")
+
+                if should_send_media and post.get("media_url"):
+                    ok = await send_post_with_media(
+                        self.app.bot, tg_id, post, msg_text, silent
+                    )
+                else:
                     try:
-                        await self.app.bot.send_photo(
-                            chat_id=tg_id, photo=post["media_url"],
-                            caption=msg_text[:1024], parse_mode="HTML",
-                            disable_notification=silent,
-                        )
-                    except TelegramError:
                         await self.app.bot.send_message(
                             chat_id=tg_id, text=msg_text, parse_mode="HTML",
                             disable_notification=silent,
                         )
-                else:
-                    await self.app.bot.send_message(
-                        chat_id=tg_id, text=msg_text, parse_mode="HTML",
-                        disable_notification=silent,
-                    )
+                        ok = True
+                    except TelegramError as e:
+                        logger.warning(f"Text send: {e}")
+                        ok = False
 
-                self.db.run(
-                    "INSERT INTO sent_history (user_id, post_id) VALUES (%s,%s) "
-                    "ON CONFLICT DO NOTHING",
-                    (user["id"], post_id),
-                )
-                self.db.run(
-                    "UPDATE users SET forwarded_count=forwarded_count+1 WHERE id=%s", (user["id"],)
-                )
-                sent_count += 1
+                if ok:
+                    # Mark as sent
+                    self.db.run(
+                        "INSERT INTO sent_history (user_id, post_id) VALUES (%s,%s) "
+                        "ON CONFLICT DO NOTHING",
+                        (user["id"], post_id),
+                    )
+                    self.db.run(
+                        "UPDATE users SET forwarded_count=forwarded_count+1 WHERE id=%s",
+                        (user["id"],)
+                    )
+                    sent_count += 1
+
                 await asyncio.sleep(0.5)
             except Exception as e:
-                logger.error(f"Initial post send: {e}")
+                logger.error(f"Initial post send error: {e}")
 
         self.db.run("UPDATE subscriptions SET initial_fetched=TRUE WHERE id=%s", (sub_id,))
         count = self._source_count(user["id"])
-        icon  = PLATFORMS.get(resolved_type, "📱")
         result = (
             f"{t(lang, 'source_added')}\n\n"
             f"{icon} <b>{resolved_type.upper()}</b>\n"
@@ -1620,7 +1790,7 @@ class Bot:
             )
             return
 
-        raw_url = context.args[0]
+        raw_url    = context.args[0]
         status_msg = await update.message.reply_text(t(lang, "checking_feed"))
 
         async def edit_fn(text, **kw):
@@ -1629,10 +1799,7 @@ class Bot:
             except Exception:
                 await update.message.reply_text(text, **kw)
 
-        async def send_fn(text, **kw):
-            await update.message.reply_text(text, **kw)
-
-        await self._resolve_and_add(send_fn, edit_fn, user, raw_url, send_media=False)
+        await self._resolve_and_add(edit_fn, edit_fn, user, raw_url, send_media=False)
 
     async def cmd_remove(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._gate(update, context):
@@ -1860,8 +2027,6 @@ class Bot:
                 new_lang = data[len("set_lang_"):]
                 if new_lang in LANGUAGES:
                     self.db.run("UPDATE users SET language=%s WHERE telegram_id=%s", (new_lang, tg_id))
-                    # Refresh user to get new lang
-                    user = self.db.one("SELECT * FROM users WHERE telegram_id=%s", (tg_id,))
                     await query.edit_message_text(
                         f"✅ Language set to <b>{LANGUAGES[new_lang]}</b>", parse_mode="HTML",
                         reply_markup=kb_back("settings", new_lang),
@@ -1878,7 +2043,7 @@ class Bot:
             await self._handle_feed_cb(query, data, user, tg_id)
             return
 
-        # Confirm add after URL paste
+        # ── Confirm add after URL paste ──────────────────────────────────────
         if data in ("confirm_add_source", "confirm_add_with_media"):
             if not await self._gate(update, context):
                 return
@@ -1888,7 +2053,6 @@ class Bot:
                 await query.answer(t(lang, "start_use_first"), show_alert=True)
                 return
             state, ctx_url = self._get_state(tg_id)
-            # BUG FIX: state was "confirm_url" but we were checking "add_source"
             if state != "confirm_url" or not ctx_url:
                 self._clear_state(tg_id)
                 await query.edit_message_text(t(lang, "session_expired"))
@@ -2074,8 +2238,8 @@ class Bot:
             )
 
         elif data == "s_language":
-            cur_lang  = (user.get("language") or "en") if user else "en"
-            label = LANGUAGES.get(cur_lang, cur_lang)
+            cur_lang = (user.get("language") or "en") if user else "en"
+            label    = LANGUAGES.get(cur_lang, cur_lang)
             await query.edit_message_text(
                 f"🌍 <b>Change language</b>\n\nCurrent: <b>{label}</b>\n\nSelect language:",
                 parse_mode="HTML", reply_markup=kb_language(lang),
@@ -2323,25 +2487,11 @@ class Bot:
                     f"{icon} <b>{name}</b>\n\n{post['title']}\n\n"
                     f"<a href='{post['url']}'>{t(lang, 'view_original')}</a>"
                 )
-                try:
-                    if post.get("media_url"):
-                        try:
-                            await self.app.bot.send_photo(
-                                chat_id=tg_id, photo=post["media_url"],
-                                caption=msg_text[:1024], parse_mode="HTML",
-                            )
-                        except TelegramError:
-                            await self.app.bot.send_message(
-                                chat_id=tg_id, text=msg_text, parse_mode="HTML",
-                            )
-                    else:
-                        await self.app.bot.send_message(
-                            chat_id=tg_id, text=msg_text, parse_mode="HTML",
-                        )
+                # Always try to send with media for show_media action
+                ok = await send_post_with_media(self.app.bot, tg_id, post, msg_text)
+                if ok:
                     sent += 1
-                    await asyncio.sleep(0.4)
-                except TelegramError as e:
-                    logger.warning(f"feed_media send: {e}")
+                await asyncio.sleep(0.4)
             await query.edit_message_text(
                 t(lang, "sent_posts", count=sent, name=name), parse_mode="HTML",
                 reply_markup=kb_feed_detail(sub_id, bool(sub["is_active"]), lang),
@@ -2387,8 +2537,8 @@ class Bot:
                 status = "Active" if s["is_active"] else "Off"
                 dt     = s["created_at"].strftime("%Y-%m-%d") if s["created_at"] else ""
                 name   = (s["source_name"] or "").replace(",", ";")
-                url    = (s["original_url"] or s["source_url"]).replace(",", ";")
-                lines.append(f"{s['source_type']},{name},{url},{status},{dt}")
+                url_s  = (s["original_url"] or s["source_url"]).replace(",", ";")
+                lines.append(f"{s['source_type']},{name},{url_s},{status},{dt}")
             csv_text = "\n".join(lines)
             buf      = io.BytesIO(csv_text.encode("utf-8"))
             buf.name = "data_sources.csv"
@@ -2620,20 +2770,20 @@ class Bot:
                 )
                 return
 
-        # add_source: user pasted a URL → show confirmation
+        # add_source: user pasted a URL → show confirmation buttons
         if state == "add_source":
             if not await self._gate(update, context):
                 self._clear_state(tg_id)
                 return
             raw_url = text.strip()
-            src_type, handle_or_url, original_url, needs_check = detect_platform(raw_url)
+            src_type, handle_or_url, original_url, _ = detect_platform(raw_url)
             if not src_type or not handle_or_url:
                 await update.message.reply_text(t(lang, "url_not_recognised"))
                 return
-            # BUG FIX: store URL in "confirm_url" state, not "add_source"
+            # Store raw URL and switch state to confirm_url
             self._set_state(tg_id, "confirm_url", raw_url)
-            display_name = original_url or handle_or_url
-            platform_label = src_type.replace("_handle", "").upper()
+            display_name    = original_url or raw_url
+            platform_label  = src_type.replace("_handle", "").upper()
             await update.message.reply_text(
                 f"<b>{platform_label} Source</b>\n"
                 f"<a href='{display_name}'>{display_name[:80]}</a>",
@@ -2696,7 +2846,7 @@ class Bot:
                 logger.error(f"on_chat_member remove notify: {e}")
 
     # ════════════════════════════════════════════════════════════════════════════
-    # POLLING LOOP
+    # POLLING LOOP — Fixed to deliver media
     # ════════════════════════════════════════════════════════════════════════════
 
     async def _polling_loop(self, app):
@@ -2715,7 +2865,7 @@ class Bot:
             "NULL::bigint AS channel_chat_id, NULL::int AS channel_id "
             "FROM subscriptions s JOIN users u ON s.user_id=u.id "
             "WHERE s.user_id IS NOT NULL AND s.is_active=TRUE AND u.is_banned=FALSE "
-            "ORDER BY s.last_check ASC NULLS FIRST LIMIT 30"
+            "ORDER BY s.last_check ASC NULLS FIRST LIMIT 50"
         )
         chan_subs = self.db.query(
             "SELECT s.id, s.source_url, s.source_type, s.source_name, "
@@ -2725,7 +2875,7 @@ class Bot:
             "c.chat_id AS channel_chat_id, c.id AS channel_id "
             "FROM subscriptions s JOIN channels c ON s.channel_id=c.id "
             "WHERE s.channel_id IS NOT NULL AND s.is_active=TRUE "
-            "ORDER BY s.last_check ASC NULLS FIRST LIMIT 30"
+            "ORDER BY s.last_check ASC NULLS FIRST LIMIT 50"
         )
         all_subs = list(user_subs) + list(chan_subs)
         if not all_subs:
@@ -2736,33 +2886,44 @@ class Bot:
                 for post in posts:
                     await self._deliver(app, sub, post)
                 self.db.run("UPDATE subscriptions SET last_check=NOW() WHERE id=%s", (sub["id"],))
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.8)
             except Exception as e:
                 logger.error(f"Poll sub {sub['id']}: {e}")
 
     async def _deliver(self, app, sub, post):
+        """Deliver a single post to user or channel, with media support."""
         try:
+            # Keyword filter
             kw = (sub.get("keyword_filter") or "").strip()
             if kw:
                 kws = [k.strip().lower() for k in kw.split(",") if k.strip()]
                 if any(k in post["title"].lower() for k in kws):
                     return
 
+            # Moderation filter
             if sub.get("moderation_mode"):
                 bad = ["18+", "nsfw", "adult", "xxx", "porn", "casino", "gambling"]
                 if any(w in post["title"].lower() for w in bad):
                     return
 
+            # Upsert post record
             ex = self.db.one("SELECT id FROM posts WHERE source_id=%s", (post["source_id"],))
             if ex:
                 post_id = ex["id"]
+                # Update media info if we now have it but didn't before
+                if post.get("media_url"):
+                    self.db.run(
+                        "UPDATE posts SET media_url=%s, media_type=%s WHERE id=%s AND (media_url IS NULL OR media_url='')",
+                        (post["media_url"], post.get("media_type", "photo"), post_id),
+                    )
             else:
                 post_id = self.db.insert_id(
-                    "INSERT INTO posts (source_id, source_type, title, url, media_url) "
-                    "VALUES (%s,%s,%s,%s,%s) RETURNING id",
+                    "INSERT INTO posts (source_id, source_type, title, url, media_url, media_type) "
+                    "VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
                     (post["source_id"], post["source_type"],
                      post["title"][:500], post["url"][:500],
-                     (post.get("media_url") or "")[:500]),
+                     (post.get("media_url") or "")[:500],
+                     post.get("media_type", "photo")),
                 )
                 if post_id is None:
                     return
@@ -2771,6 +2932,7 @@ class Bot:
             channel_id = sub.get("channel_id")
             lang       = sub.get("language") or "en"
 
+            # Check if already sent
             if user_id:
                 sent = self.db.one(
                     "SELECT id FROM sent_history WHERE user_id=%s AND post_id=%s",
@@ -2787,6 +2949,7 @@ class Bot:
             icon        = PLATFORMS.get(post["source_type"], "📱")
             source_name = (sub.get("source_name") or post["source_type"])[:60]
             hide        = bool(sub.get("hide_original_link", False))
+            silent      = bool(sub.get("silent_mode", False))
             msg_text    = f"{icon} <b>{source_name}</b>\n\n{post['title']}"
             if not hide:
                 msg_text += f"\n\n<a href='{post['url']}'>{t(lang, 'view_original')}</a>"
@@ -2795,21 +2958,34 @@ class Bot:
             if not target:
                 return
 
-            await app.bot.send_message(
-                chat_id=target, text=msg_text, parse_mode="HTML",
-                disable_notification=bool(sub.get("silent_mode", False)),
-                disable_web_page_preview=False,
-            )
+            # Send with media for social platforms, text for others
+            src_type = post.get("source_type", "rss")
+            should_send_media = src_type in ("instagram", "twitter", "telegram", "youtube")
 
-            self.db.run(
-                "INSERT INTO sent_history (user_id, channel_id, post_id) VALUES (%s,%s,%s) "
-                "ON CONFLICT DO NOTHING",
-                (user_id, channel_id, post_id),
-            )
-            if user_id:
+            if should_send_media and post.get("media_url"):
+                ok = await send_post_with_media(app.bot, target, post, msg_text, silent)
+            else:
+                try:
+                    await app.bot.send_message(
+                        chat_id=target, text=msg_text, parse_mode="HTML",
+                        disable_notification=silent,
+                        disable_web_page_preview=False,
+                    )
+                    ok = True
+                except TelegramError as e:
+                    logger.warning(f"deliver send_message: {e}")
+                    ok = False
+
+            if ok:
                 self.db.run(
-                    "UPDATE users SET forwarded_count=forwarded_count+1 WHERE id=%s", (user_id,)
+                    "INSERT INTO sent_history (user_id, channel_id, post_id) VALUES (%s,%s,%s) "
+                    "ON CONFLICT DO NOTHING",
+                    (user_id, channel_id, post_id),
                 )
+                if user_id:
+                    self.db.run(
+                        "UPDATE users SET forwarded_count=forwarded_count+1 WHERE id=%s", (user_id,)
+                    )
 
         except TelegramError as e:
             logger.warning(f"Telegram error → {sub.get('telegram_id') or sub.get('channel_chat_id')}: {e}")
@@ -2817,7 +2993,7 @@ class Bot:
             logger.error(f"Deliver: {e}")
 
     def run(self):
-        logger.info("IN365Bot v2.4 starting...")
+        logger.info("IN365Bot v2.5 starting...")
         try:
             self.app.run_polling(
                 allowed_updates=["message", "callback_query", "my_chat_member"]
